@@ -61,6 +61,8 @@ using namespace boost::python;
 namespace np = boost::python::numpy;
 OIIO_NAMESPACE_USING
 
+#define STREQ(a, b) (strcmp(a, b) == 0)
+
 namespace luxcore {
 namespace blender {
 
@@ -76,6 +78,23 @@ static int CustomData_get_active_layer_index(const CustomData *data, int type)
 }
 
 template<typename CustomData>
+static int CustomData_get_named_layer_index(const CustomData* data, const int type, const char* name)
+{
+	cout << "Tot layer: " << data->totlayer << endl;
+
+	for (int i = 0; i < data->totlayer; i++) {
+		cout << i << ":" << data->layers[i].name << ", " << data->layers[i].type << endl;
+		if (data->layers[i].type == type) {
+			if (STREQ(data->layers[i].name, name)) {
+				return i;
+			}
+		}
+	}
+
+	return -1;
+}
+
+template<typename CustomData>
 static void *CustomData_get_layer(const CustomData *data, int type)
 {
 	/* get the layer index of the active layer of type */
@@ -87,6 +106,17 @@ static void *CustomData_get_layer(const CustomData *data, int type)
 	return data->layers[layer_index].data;
 }
 
+template<typename CustomData>
+static void* CustomData_get_layer_named(const CustomData* data, int type, const char *name)
+{
+	/* get the layer index of the active layer of type */
+	int layer_index = CustomData_get_named_layer_index(data, type, name);
+	if (layer_index == -1) {
+		return nullptr;
+	}
+
+	return data->layers[layer_index].data;
+}
 //------------------------------------------------------------------------------
 // Utility functions
 //------------------------------------------------------------------------------
@@ -669,17 +699,25 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 		const short matIndex,
 		const luxrays::Transform *trans,
 		const boost::python::tuple &blenderVersion,
+		const boost::python::object& material_indices,
 		const boost::python::object &loopTriCustomNormals) {
 
 	const MLoopTri *loopTris = reinterpret_cast<const MLoopTri *>(loopTriPtr);
-	const MLoop *loops = reinterpret_cast<const MLoop *>(loopPtr);
-	const MVert *verts = reinterpret_cast<const MVert *>(vertPtr);
+	const MLoop *loops = reinterpret_cast<const MLoop *>(loopPtr);	
 	const MPoly *polygons = reinterpret_cast<const MPoly *>(polyPtr);
 	const float(*normals)[3] = nullptr;
 	normals = reinterpret_cast<const float(*)[3]>(normalPtr);
 
 	extract<boost::python::list> getUVPtrList(loopUVsPtrList);
 	extract<boost::python::list> getColPtrList(loopColsPtrList);
+
+	if (len(blenderVersion) != 3) {
+		throw runtime_error("Blender version tuple needs to have exactly 3 elements for Scene.DefineMesh()");
+	}
+
+	const int blenderVersionMajor = extract<int>(blenderVersion[0]);
+	const int blenderVersionMinor = extract<int>(blenderVersion[1]);
+	const int blenderVersionSub = extract<int>(blenderVersion[2]);			
 
     // Check UVs
     if (!getUVPtrList.check()) {
@@ -712,25 +750,18 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 	{
 		const float(*loopNormals)[3] = nullptr;
 		u_int loopCount = 0;
-		
-		if (len(blenderVersion) != 3) {
-			throw runtime_error("Blender version tuple needs to have exactly 3 elements for Scene.DefineMesh()");
-		}
-		const int blenderVersionMajor = extract<int>(blenderVersion[0]);
-		const int blenderVersionMinor = extract<int>(blenderVersion[1]);
-		const int blenderVersionSub = extract<int>(blenderVersion[2]);
-		
+				
 		if (blenderVersionMajor == 2 && blenderVersionMinor == 82 && blenderVersionSub == 7) {
-			const blender_2_82::Mesh *mesh = reinterpret_cast<const blender_2_82::Mesh*>(meshPtr);
+			const blender_2_82::Mesh* mesh = reinterpret_cast<const blender_2_82::Mesh*>(meshPtr);
 			loopNormals = static_cast<const float(*)[3]>(CustomData_get_layer(&mesh->ldata, blender_2_82::CD_NORMAL));
 			loopCount = mesh->totloop;
 		} else if (blenderVersionMajor == 2 && blenderVersionMinor == 83) {
 			// Not checking the sub version here, for now we assume that these data structures stay the same across sub releases
-			const blender_2_83::Mesh *mesh = reinterpret_cast<const blender_2_83::Mesh*>(meshPtr);
+			const blender_2_83::Mesh* mesh = reinterpret_cast<const blender_2_83::Mesh*>(meshPtr);
 			loopNormals = static_cast<const float(*)[3]>(CustomData_get_layer(&mesh->ldata, blender_2_83::CD_NORMAL));
 			loopCount = mesh->totloop;
 		}
-		
+
 		if (loopNormals) {
 			hasCustomNormals = true;
 			for (u_int i = 0; i < loopCount; ++i) {
@@ -760,7 +791,7 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 		}
 	}
 
-	vector<const MLoopUV *> loopUVsList;
+	vector<size_t> loopUVsList;
 	vector<const MLoopCol *> loopColsList;
 	vector<Point> tmpMeshVerts;
 	vector<Normal> tmpMeshNorms;
@@ -769,8 +800,7 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 	vector<Triangle> tmpMeshTris;
 
 	for (u_int i = 0; i < loopUVsCount; ++i) {
-		const size_t UVListPtr = extract<size_t>(UVsList[i]);
-		loopUVsList.push_back(reinterpret_cast<const MLoopUV *>(UVListPtr));
+		loopUVsList.push_back(extract<size_t>(UVsList[i]));
 
 		vector<UV> temp;
 		tmpMeshUVs.push_back(temp);
@@ -788,14 +818,19 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 	boost::unordered_map<u_int, u_int> vertexMap;
 
 	const float normalScale = 1.f / 32767.f;
-	const float rgbScale = 1.f / 255.f;
+	const float rgbScale = 1.f / 255.f;	
 
 	for (u_int loopTriIndex = 0; loopTriIndex < loopTriCount; ++loopTriIndex) {
 		const MLoopTri &loopTri = loopTris[loopTriIndex];
 		const MPoly &poly = polygons[loopTri.poly];
 
-		if (poly.mat_nr != matIndex)
-			continue;
+		if (blenderVersionMajor == 3 && blenderVersionMinor >= 4 && !material_indices.is_none()) {
+			if (material_indices[loopTri.poly] != matIndex)
+				continue;
+		} else {
+			if (poly.mat_nr != matIndex)
+				continue;
+		}
 
 		u_int vertIndices[3];
 
@@ -815,17 +850,31 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 						alreadyDefined = false;
 					
 					for (u_int uvLayerIndex = 0; uvLayerIndex < loopUVsList.size() && alreadyDefined; ++uvLayerIndex) {
-						const MLoopUV *loopUVs = loopUVsList[uvLayerIndex];
-
-						if (loopUVs) {
-							const MLoopUV &loopUV = loopUVs[tri];
-							// Check if the already defined vertex has the right UV coordinates
-							if ((loopUV.uv[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
-								(loopUV.uv[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
-								// I have to create a new vertex
-								alreadyDefined = false;
+						
+						if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+							const MLoopUV* loopUVs = reinterpret_cast<const MLoopUV*>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {
+								const MLoopUV& loopUV = loopUVs[tri];								
+								// Check if the already defined vertex has the right UV coordinates
+								if ((loopUV.uv[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
+									(loopUV.uv[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
+									// I have to create a new vertex
+									alreadyDefined = false;
+								}
 							}
 						}
+						else {
+							const float(*loopUVs)[2] = reinterpret_cast<const float(*)[2]>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {
+								const float* loopUV = loopUVs[tri];
+								// Check if the already defined vertex has the right UV coordinates
+								if ((loopUV[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
+									(loopUV[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
+									// I have to create a new vertex
+									alreadyDefined = false;
+								}
+							}
+						}				
 					}
 					for (u_int colLayerIndex = 0; colLayerIndex < loopColsList.size() && alreadyDefined; ++colLayerIndex) {
 						const MLoopCol *loopCols = loopColsList[colLayerIndex];
@@ -846,10 +895,18 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 				if (alreadyDefined)
 					vertIndices[i] = vertexMap[index];
 				else {
-					const MVert &vertex = verts[index];
+					const float *vertex;
+
+					if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+						const MVert* verts = reinterpret_cast<const MVert*>(vertPtr);
+						vertex = verts[index].co;
+					} else {
+						const float(*verts)[3] = reinterpret_cast<const float(*)[3]>(vertPtr);
+						vertex = verts[index];
+					};					
 
 					// Add the vertex
-					tmpMeshVerts.emplace_back(Point(vertex.co));
+					tmpMeshVerts.emplace_back(Point(vertex));
 
 					// Add the normal
 					if (hasCustomNormals) {
@@ -863,10 +920,19 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 					
 					// Add the UV
 					for (u_int uvLayerIndex = 0; uvLayerIndex < loopUVsList.size(); ++uvLayerIndex) {
-						const MLoopUV *loopUVs = loopUVsList[uvLayerIndex];
-						if (loopUVs) {
-							const MLoopUV &loopUV = loopUVs[tri];
-							tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV.uv));
+						if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+							const MLoopUV* loopUVs = reinterpret_cast<const MLoopUV*>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {
+								const MLoopUV& loopUV = loopUVs[tri];								
+								tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV.uv));								
+							}
+						}
+						else {
+							const float(*loopUVs)[2] = reinterpret_cast<const float(*)[2]>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {								
+								const float* loopUV = loopUVs[tri];								
+								tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV));
+							}
 						}
 					}
 					// Add the color
@@ -888,13 +954,27 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 			}
 		} else {
 			// Flat shaded, use the Blender face normal
-			const MVert &v0 = verts[loops[loopTri.tri[0]].v];
-			const MVert &v1 = verts[loops[loopTri.tri[1]].v];
-			const MVert &v2 = verts[loops[loopTri.tri[2]].v];
+			const float* v0;
+			const float* v1;
+			const float* v2;
 
-			const Point p0(v0.co);
-			const Point p1(v1.co);
-			const Point p2(v2.co);
+			if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+				const MVert* verts = reinterpret_cast<const MVert*>(vertPtr);
+				v0 = verts[loops[loopTri.tri[0]].v].co;
+				v1 = verts[loops[loopTri.tri[1]].v].co;
+				v2 = verts[loops[loopTri.tri[2]].v].co;
+			}
+			else {
+				const float(*verts)[3] = reinterpret_cast<const float(*)[3]>(vertPtr);
+				v0 = verts[loops[loopTri.tri[0]].v];
+				v1 = verts[loops[loopTri.tri[1]].v];
+				v2 = verts[loops[loopTri.tri[2]].v];
+			};
+
+
+			const Point p0(v0);
+			const Point p1(v1);
+			const Point p2(v2);
 
 			const Vector e1 = p1 - p0;
 			const Vector e2 = p2 - p0;
@@ -918,15 +998,27 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 						alreadyDefined = false;
 					
 					for (u_int uvLayerIndex = 0; uvLayerIndex < loopUVsList.size() && alreadyDefined; ++uvLayerIndex) {
-						const MLoopUV * loopUVs = loopUVsList[uvLayerIndex];
-
-						if (loopUVs) {
-							const MLoopUV &loopUV = loopUVs[tri];
-							// Check if the already defined vertex has the right UV coordinates
-							if ((loopUV.uv[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
-								(loopUV.uv[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
-								// I have to create a new vertex
-								alreadyDefined = false;
+						if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+							const MLoopUV* loopUVs = reinterpret_cast<const MLoopUV *>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {
+								const MLoopUV& loopUV = loopUVs[tri];								
+								// Check if the already defined vertex has the right UV coordinates
+								if ((loopUV.uv[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
+									(loopUV.uv[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
+									// I have to create a new vertex
+									alreadyDefined = false;
+								}
+							}
+						} else {
+							const float(*loopUVs)[2] = reinterpret_cast<const float(*)[2]>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {								
+								const float* loopUV = loopUVs[tri];
+								// Check if the already defined vertex has the right UV coordinates
+								if ((loopUV[0] != tmpMeshUVs[uvLayerIndex][mappedIndex].u) ||
+									(loopUV[1] != tmpMeshUVs[uvLayerIndex][mappedIndex].v)) {
+									// I have to create a new vertex
+									alreadyDefined = false;
+								}
 							}
 						}
 					}
@@ -949,19 +1041,37 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 				if (alreadyDefined)
 					vertIndices[i] = vertexMap[index];
 				else {
-					const MVert &vertex = verts[index];
+
+					const float *vertex;
+					if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+						const MVert* verts = reinterpret_cast<const MVert*>(vertPtr);
+						vertex = verts[index].co;
+					}
+					else {
+						const float(*verts)[3] = reinterpret_cast<const float(*)[3]>(vertPtr);
+						vertex = verts[index];
+					};
 
 					// Add the vertex
-					tmpMeshVerts.emplace_back(Point(vertex.co));
+					tmpMeshVerts.emplace_back(Point(vertex));
 					// Add the normal (same for all vertices of this face, to have flat shading)
 					tmpMeshNorms.push_back(faceNormal);
 
 					// Add the UV
 					for (u_int uvLayerIndex = 0; uvLayerIndex < loopUVsList.size(); ++uvLayerIndex) {
-						const MLoopUV * loopUVs = loopUVsList[uvLayerIndex];
-						if (loopUVs) {
-							const MLoopUV &loopUV = loopUVs[tri];
-							tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV.uv));
+						if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+							const MLoopUV* loopUVs = reinterpret_cast<const MLoopUV*>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {
+								const MLoopUV& loopUV = loopUVs[tri];								
+								tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV.uv));
+							}
+						}
+						else {
+							const float(*loopUVs)[2] = reinterpret_cast<const float(*)[2]>(loopUVsList[uvLayerIndex]);
+							if (loopUVs) {								
+								const float* loopUV = loopUVs[tri];
+								tmpMeshUVs[uvLayerIndex].push_back(UV(loopUV));
+							}
 						}
 					}
 					// Add the color
@@ -1007,12 +1117,21 @@ static bool Scene_DefineBlenderMesh(luxcore::detail::SceneImpl *scene, const str
 	fill(meshCols.begin(), meshCols.end(), nullptr);
 	
 	for (u_int i = 0; i < loopUVsList.size(); ++i) {
-		const MLoopUV * loopUVs = loopUVsList[i];
-		if (loopUVs) {
-			meshUVs[i] = new UV[tmpMeshVerts.size()];
-			copy(tmpMeshUVs[i].begin(), tmpMeshUVs[i].end(), meshUVs[i]);
+		if (blenderVersionMajor == 3 && blenderVersionMinor < 5) {
+			const MLoopUV* loopUVs = reinterpret_cast<const MLoopUV*>(loopUVsList[i]);
+			if (loopUVs) {
+				meshUVs[i] = new UV[tmpMeshVerts.size()];
+				copy(tmpMeshUVs[i].begin(), tmpMeshUVs[i].end(), meshUVs[i]);
+			}
+		} else {
+			const float(*loopUVs)[2] = reinterpret_cast<const float(*)[2]>(loopUVsList[i]);
+			if (loopUVs) {
+				meshUVs[i] = new UV[tmpMeshVerts.size()];
+				copy(tmpMeshUVs[i].begin(), tmpMeshUVs[i].end(), meshUVs[i]);
+			}
 		}
 	}
+
 	for (u_int i = 0; i < loopColsList.size(); ++i) {
 		const MLoopCol * loopCols = loopColsList[i];
 		if (loopCols) {
@@ -1047,7 +1166,8 @@ boost::python::list Scene_DefineBlenderMesh1(luxcore::detail::SceneImpl *scene, 
 		const u_int materialCount,
 		const boost::python::object &transformation,
 		const boost::python::tuple &blenderVersion,
-		const boost::python::object &loopTriCustomNormals) {
+		const boost::python::object& material_indices,
+		const boost::python::object& loopTriCustomNormals) {
 	
 	// Get the transformation if required
 	bool hasTransformation = false;
@@ -1068,6 +1188,7 @@ boost::python::list Scene_DefineBlenderMesh1(luxcore::detail::SceneImpl *scene, 
 				matIndex,
 				hasTransformation ? &trans : NULL,
 				blenderVersion,
+				material_indices,
 				loopTriCustomNormals)) {
 			boost::python::list meshInfo;
 			meshInfo.append(meshName);
@@ -1090,10 +1211,11 @@ boost::python::list Scene_DefineBlenderMesh2(luxcore::detail::SceneImpl *scene, 
 		const size_t meshPtr,
 		const u_int materialCount,
 		const boost::python::tuple &blenderVersion,
+		const boost::python::object& material_indices,
 		const boost::python::object &loopTriCustomNormals) {
 	return Scene_DefineBlenderMesh1(scene, name, loopTriCount, loopTriPtr,
 		loopPtr, vertPtr, normalPtr, polyPtr, loopUVsPtrList, loopColsPtrList,
-		meshPtr, materialCount, boost::python::object(), blenderVersion, 
+		meshPtr, materialCount, boost::python::object(), blenderVersion, material_indices,
 		loopTriCustomNormals);
 }
 
